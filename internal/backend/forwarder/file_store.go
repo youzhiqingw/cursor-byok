@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -120,10 +121,15 @@ func (store *ConversationFileStore) LoadConversation(conversationID string) (*Co
 
 // AppendEntries 把已经发生的语义事件追加到 context.json，并同步 state.json。
 func (store *ConversationFileStore) AppendEntries(conversationID string, entries []HistoryEntry) (*ConversationFile, []HistoryEntry, error) {
+	return store.AppendEntriesWithUpdate(conversationID, entries, nil)
+}
+
+// AppendEntriesWithUpdate 原子追加 context entries，并在同一把会话锁内更新 state metadata。
+func (store *ConversationFileStore) AppendEntriesWithUpdate(conversationID string, entries []HistoryEntry, update func(*ConversationFile) error) (*ConversationFile, []HistoryEntry, error) {
 	if store == nil {
 		return nil, nil, fmt.Errorf("conversation file store is nil")
 	}
-	if len(entries) == 0 {
+	if len(entries) == 0 && update == nil {
 		conversation, err := store.LoadConversation(conversationID)
 		return conversation, nil, err
 	}
@@ -161,6 +167,11 @@ func (store *ConversationFileStore) AppendEntries(conversationID string, entries
 		conversation.Mode = alias
 	}
 	assigned := appendEntriesInPlace(conversation, entries)
+	if update != nil {
+		if err := update(conversation); err != nil {
+			return nil, nil, err
+		}
+	}
 	deriveConversationLoopState(conversation)
 	if err := store.writeConversationLocked(normalizedConversationID, conversation); err != nil {
 		return nil, nil, err
@@ -438,7 +449,11 @@ func (store *ConversationFileStore) writeConversationLocked(conversationID strin
 	if err := store.writeContextLocked(conversationID, conversation); err != nil {
 		return err
 	}
-	return store.writeConversationMetaLocked(conversationID, conversation)
+	if err := store.writeConversationMetaLocked(conversationID, conversation); err != nil {
+		return err
+	}
+	store.syncCursorTranscriptBestEffort(conversationID, conversation)
+	return nil
 }
 
 func (store *ConversationFileStore) writeConversationMetaLocked(conversationID string, conversation *ConversationFile) error {
@@ -475,6 +490,70 @@ func (store *ConversationFileStore) writeContextLocked(conversationID string, co
 		Items:          append([]HistoryEntry(nil), conversation.Entries...),
 	}
 	return writeJSONFileAtomic(store.contextPath(conversationID), context)
+}
+
+func (store *ConversationFileStore) syncCursorTranscriptBestEffort(conversationID string, conversation *ConversationFile) {
+	if store == nil || conversation == nil {
+		return
+	}
+	folder := normalizeAgentTranscriptsFolder(conversation.AgentTranscriptsFolder)
+	if folder == "" {
+		return
+	}
+	if err := store.syncCursorTranscript(conversationID, conversation, folder); err != nil {
+		log.Printf("forwarder transcript sync failed conversation_id=%s err=%v", strings.TrimSpace(conversationID), err)
+	}
+}
+
+func (store *ConversationFileStore) syncCursorTranscript(conversationID string, conversation *ConversationFile, transcriptsFolder string) error {
+	return store.syncCursorTranscriptWithLatestStatus(conversationID, conversation, transcriptsFolder, false)
+}
+
+func (store *ConversationFileStore) syncCursorTranscriptWithLatestStatus(conversationID string, conversation *ConversationFile, transcriptsFolder string, includeLatestStatus bool) error {
+	if store == nil || conversation == nil {
+		return nil
+	}
+	path, err := cursorTranscriptPath(transcriptsFolder, conversationID)
+	if err != nil {
+		return err
+	}
+	data, err := projectCursorTranscriptJSONLWithLatestStatus(conversation, includeLatestStatus)
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	data = preserveCursorAppendedTurnEnded(path, data)
+	return writeCursorTranscriptAtomic(path, data)
+}
+
+func (store *ConversationFileStore) SyncAllCursorTranscriptsBestEffort() {
+	if store == nil {
+		return
+	}
+	conversationIDs, err := store.ListConversationIDs()
+	if err != nil {
+		log.Printf("forwarder transcript backfill scan failed err=%v", err)
+		return
+	}
+	for _, conversationID := range conversationIDs {
+		conversation, err := store.LoadConversation(conversationID)
+		if err != nil {
+			log.Printf("forwarder transcript backfill load failed conversation_id=%s err=%v", conversationID, err)
+			continue
+		}
+		if conversation == nil || conversation.AgentTranscriptsFolder == "" {
+			continue
+		}
+		info, err := os.Stat(conversation.AgentTranscriptsFolder)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		if err := store.syncCursorTranscriptWithLatestStatus(conversationID, conversation, conversation.AgentTranscriptsFolder, true); err != nil {
+			log.Printf("forwarder transcript backfill failed conversation_id=%s err=%v", conversationID, err)
+		}
+	}
 }
 
 func contextVersionForEntries(entries []HistoryEntry) int64 {
@@ -621,9 +700,21 @@ func appendEntriesInPlace(conversation *ConversationFile, entries []HistoryEntry
 	}
 	now := time.Now().UTC()
 	assigned := make([]HistoryEntry, 0, len(entries))
+	existingIdempotencyKeys := make(map[string]struct{})
+	for _, existing := range conversation.Entries {
+		if key := strings.TrimSpace(existing.IdempotencyKey); key != "" {
+			existingIdempotencyKeys[key] = struct{}{}
+		}
+	}
 	maxTurnSeq := conversation.NextTurnSeq - 1
 	for _, entry := range entries {
 		next := entry
+		if key := strings.TrimSpace(next.IdempotencyKey); key != "" {
+			if _, exists := existingIdempotencyKeys[key]; exists {
+				continue
+			}
+			existingIdempotencyKeys[key] = struct{}{}
+		}
 		if next.CreatedAt.IsZero() {
 			next.CreatedAt = now
 		}
@@ -663,6 +754,9 @@ func mergeConversationMetadata(target *ConversationFile, source *ConversationFil
 	target.ParentConversationID = strings.TrimSpace(source.ParentConversationID)
 	target.ParentToolCallID = strings.TrimSpace(source.ParentToolCallID)
 	target.SubagentTypeName = strings.TrimSpace(source.SubagentTypeName)
+	if folder := normalizeAgentTranscriptsFolder(source.AgentTranscriptsFolder); folder != "" {
+		target.AgentTranscriptsFolder = folder
+	}
 	if strings.TrimSpace(source.Mode) != "" {
 		target.Mode = strings.TrimSpace(source.Mode)
 	}
@@ -678,6 +772,7 @@ func mergeConversationMetadata(target *ConversationFile, source *ConversationFil
 	target.CurrentPlanText = source.CurrentPlanText
 	target.CurrentPlans = clonePlanRegistryEntries(source.CurrentPlans)
 	target.CurrentTodos = cloneTodoItems(source.CurrentTodos)
+	target.ImportedTurnIDs = cloneByteSlices(source.ImportedTurnIDs)
 	target.LatestRequestPrefix = cloneConversationRequestPrefix(source.LatestRequestPrefix)
 	target.LastProviderCall = cloneConversationProviderCall(source.LastProviderCall)
 	if !source.CreatedAt.IsZero() && (target.CreatedAt.IsZero() || source.CreatedAt.Before(target.CreatedAt)) {
@@ -717,6 +812,10 @@ func normalizeLoadedConversation(conversationID string, conversation *Conversati
 	}
 	if conversation.Entries == nil {
 		conversation.Entries = make([]HistoryEntry, 0, 16)
+	}
+	conversation.AgentTranscriptsFolder = normalizeAgentTranscriptsFolder(conversation.AgentTranscriptsFolder)
+	if conversation.AgentTranscriptsFolder == "" {
+		conversation.AgentTranscriptsFolder = agentTranscriptsFolderFromEntries(conversation.Entries)
 	}
 	for _, entry := range conversation.Entries {
 		if entry.Seq >= conversation.NextEntrySeq {
@@ -806,6 +905,7 @@ func cloneConversationFile(conversation *ConversationFile) *ConversationFile {
 	cloned := *conversation
 	cloned.CurrentPlans = clonePlanRegistryEntries(conversation.CurrentPlans)
 	cloned.CurrentTodos = cloneTodoItems(conversation.CurrentTodos)
+	cloned.ImportedTurnIDs = cloneByteSlices(conversation.ImportedTurnIDs)
 	cloned.LatestRequestPrefix = cloneConversationRequestPrefix(conversation.LatestRequestPrefix)
 	cloned.LastProviderCall = cloneConversationProviderCall(conversation.LastProviderCall)
 	cloned.Entries = append([]HistoryEntry(nil), conversation.Entries...)

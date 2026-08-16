@@ -22,6 +22,7 @@ type ConversationFile struct {
 	ParentConversationID            string                                `json:"parent_conversation_id"`
 	ParentToolCallID                string                                `json:"parent_tool_call_id"`
 	SubagentTypeName                string                                `json:"subagent_type_name,omitempty"`
+	AgentTranscriptsFolder          string                                `json:"agent_transcripts_folder,omitempty"`
 	Mode                            string                                `json:"mode"`
 	ContextVersion                  int64                                 `json:"context_version,omitempty"`
 	CurrentLoopID                   string                                `json:"current_loop_id,omitempty"`
@@ -38,6 +39,7 @@ type ConversationFile struct {
 	CurrentPlanText                 string                                `json:"current_plan_text,omitempty"`
 	CurrentPlans                    map[string]*agentv1.PlanRegistryEntry `json:"current_plans,omitempty"`
 	CurrentTodos                    []*agentv1.TodoItem                   `json:"current_todos,omitempty"`
+	ImportedTurnIDs                 [][]byte                              `json:"imported_turn_ids,omitempty"`
 	LatestRequestPrefix             *ConversationRequestPrefix            `json:"latest_request_prefix,omitempty"`
 	LastProviderCall                *ConversationProviderCall             `json:"last_provider_call,omitempty"`
 	CreatedAt                       time.Time                             `json:"created_at"`
@@ -78,6 +80,7 @@ type HistoryEntry struct {
 	Seq              int64           `json:"seq"`
 	TurnSeq          int64           `json:"turn_seq"`
 	RequestID        string          `json:"request_id,omitempty"`
+	IdempotencyKey   string          `json:"idempotency_key,omitempty"`
 	Role             string          `json:"role"`
 	Kind             string          `json:"kind"`
 	ToolCallID       string          `json:"tool_call_id,omitempty"`
@@ -116,6 +119,11 @@ type StreamSubscriber struct {
 	Signal chan struct{}
 }
 
+type manualCompactionDirective struct {
+	Requested   bool
+	Instruction string
+}
+
 type ActiveStream struct {
 	mu sync.Mutex
 
@@ -126,6 +134,7 @@ type ActiveStream struct {
 	ModelName              string
 	Mode                   agentv1.AgentMode
 	LatestUserText         string
+	ManualCompaction       manualCompactionDirective
 	Status                 StreamStatus
 	ThinkingEffort         string
 	SubagentModelOverrides map[string]runtimecore.SubagentModelOverrideSelection
@@ -156,6 +165,10 @@ type ActiveStream struct {
 	ProviderUsage                               turnUsageSnapshot
 	ProviderTerminalToolInvocation              bool
 	PendingCompaction                           *PendingCompaction
+	PendingCheckpointBlobWrites                 map[uint32]string
+	ConfirmedCheckpointBlobs                    map[string]struct{}
+	NextCheckpointBlobRequestID                 uint32
+	PendingCheckpoint                           *pendingCheckpointPublish
 
 	Backlog                     []StreamEvent
 	Subscribers                 map[string]*StreamSubscriber
@@ -210,6 +223,27 @@ type pendingTurnCompletion struct {
 	ProviderPass   int
 	Usage          turnUsageSnapshot
 	Disposition    pendingCompletionDisposition
+}
+
+type checkpointTerminalActionKind uint8
+
+const (
+	checkpointTerminalActionNone checkpointTerminalActionKind = iota
+	checkpointTerminalActionComplete
+	checkpointTerminalActionFail
+)
+
+type checkpointTerminalAction struct {
+	Kind         checkpointTerminalActionKind
+	Completion   pendingTurnCompletion
+	ErrorCode    string
+	ErrorMessage string
+}
+
+type pendingCheckpointPublish struct {
+	State    *agentv1.ConversationStateStructure
+	Required map[string]struct{}
+	Terminal checkpointTerminalAction
 }
 
 type PendingCompaction struct {
@@ -407,9 +441,11 @@ type InboundIntent struct {
 	HasExplicitMode          bool
 	ModeSource               ModeSource
 	StartsRun                bool
+	ManualCompaction         manualCompactionDirective
 	SubagentTypeName         string
 	SubagentModelOverrides   map[string]runtimecore.SubagentModelOverrideSelection
 	ConversationState        *agentv1.ConversationStateStructure
+	PreFetchedBlobs          []*agentv1.PreFetchedBlob
 	UserMessage              *agentv1.UserMessage
 	RequestContext           *agentv1.RequestContext
 	ClientMessage            *agentv1.AgentClientMessage

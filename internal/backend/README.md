@@ -1,6 +1,6 @@
 # Backend 架构说明
 
-`internal/backend` 当前支持本地助手模式与直连上游模式。
+`internal/backend` 只支持本地助手模式。
 
 关于 backend agent「最小事实集合」的第一阶段研究文档，见 [`../../docs/backend-agent-minimum-facts-phase1.md`](../../docs/backend-agent-minimum-facts-phase1.md)。
 
@@ -34,7 +34,6 @@ internal/backend/
     errors.go
     local.go
     middleware.go
-    policy.go
     route.go
     url.go
 
@@ -98,6 +97,7 @@ internal/backend/
 
 - `~/.cursor-local-assistant-v2/config.yaml`
 - `~/.cursor-local-assistant-v2/data/ca.crt`
+- `~/.cursor-local-assistant-v2/data/ca.key`
 - `~/.cursor-local-assistant-v2/data/ads/`
 - `~/.cursor-local-assistant-v2/history/`
 - `~/.cursor-local-assistant-v2/logs/`
@@ -105,7 +105,8 @@ internal/backend/
 约定：
 
 - `config.yaml` 是用户配置
-- `data/ca.crt` 是注入给宿主的 CA 证书
+- `data/ca.crt` 是首次运行时为当前用户生成、注入给宿主的 CA 证书
+- `data/ca.key` 是与该证书配套的本地私钥，权限固定为 `0600`，不得打包或提交到仓库
 - `data/ads/` 是广告包与资源缓存目录
 - `history/` 是会话事实与全局 usage JSON 目录，不属于日志
 - `logs/` 只保留必要文本运行日志
@@ -134,7 +135,7 @@ history/
 ## 请求流
 
 1. 请求进入 backend 根路由。
-2. `PolicyMiddleware` 根据 `routing.mode` 与 `X-Server-Upstream-URL` 选择本地或上游分支。
+2. `ServerContext` 解析 MITM 带入的原始目标地址，路由始终执行本地 action。
 3. `BidiAppend` / `RunSSE` 进入 `forwarder`。
 4. `forwarder` 先把当前 loop 状态写入 `state.json`，再把已发生语义事件追加到 `context.json`。
 5. 发给 LLM 的 prompt 只由 `context.json` 投射生成；`state.json` 不保存可投射历史。

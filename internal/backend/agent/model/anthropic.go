@@ -156,6 +156,18 @@ func anthropicEndpointURL(baseURL string) string {
 	return base + "/v1/messages"
 }
 
+// shouldRelocateAnthropicImages 判断是否需要把图片块搬运到末条 user 消息。
+//
+// 官方 Anthropic 端点（api.anthropic.com）可正确处理任意位置的图片，保持原样；
+// 其余第三方中转站默认启用搬运，规避「非末尾图片被丢弃」的转换问题。
+func shouldRelocateAnthropicImages(baseURL string) bool {
+	base := strings.ToLower(strings.TrimSpace(baseURL))
+	if base == "" {
+		return false
+	}
+	return !strings.Contains(base, "api.anthropic.com")
+}
+
 // ApplyAnthropicCompatibleAuthHeaders 同时兼容 Anthropic 原生 x-api-key 和 Bearer token 代理。
 func ApplyAnthropicCompatibleAuthHeaders(httpReq *http.Request, apiKey string) {
 	if httpReq == nil {
@@ -215,8 +227,9 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 	body := cloneRequestBodyOverride(req.RequestBodyOverride)
 	if len(body) == 0 {
 		thinkingConfig := buildAnthropicThinkingConfig(req)
+		relocateImages := shouldRelocateAnthropicImages(baseURL)
 		stableMessageCount := anthropicStableProviderMessageCount(req.Messages, req.StableMessageCount, thinkingConfig != nil)
-		systemParts, messages, err := normalizeAnthropicProviderMessages(req.Messages, thinkingConfig != nil)
+		systemParts, messages, err := normalizeAnthropicProviderMessages(req.Messages, thinkingConfig != nil, relocateImages)
 		if err != nil {
 			return err
 		}
@@ -261,18 +274,17 @@ func (adapter *AnthropicAdapter) Stream(ctx context.Context, req StreamRequest, 
 			body["tools"] = tools
 		}
 		body["system"] = anthropicProviderSystemBlocks(systemParts)
-		if thinkingConfig != nil {
-			body["thinking"] = thinkingConfig
-			if normalizeRuntimeThinkingEffort(req.ThinkingEffort) != "disabled" {
-				body["output_config"] = buildAnthropicOutputConfig(req)
-			}
-		}
 		frontier := buildAnthropicCacheFrontier(body, stableMessageCount)
 		req.RequestKnobs = annotateAnthropicRequestKnobs(req.RequestKnobs, body, frontier)
 		body = cloneRequestBodyOverride(body)
 		applyAnthropicCacheBreakpoints(body, frontier.BreakpointPositions)
 		frontier.BreakpointCount = len(frontier.BreakpointPositions)
 	}
+	// applyAnthropicThinkingConfig 在 override 块之外无条件调用，确保 RequestBodyOverride
+	// 路径与正常构造路径行为一致：disabled 时强制 thinking:{type:disabled} 并清理冲突字段，
+	// 非 disabled 时按 AnthropicThinkingEffort 写 adaptive 配置。与 openai.go 的
+	// applyOpenAIThinkingDisable 对称——后者也是无条件在两条路径之后调用。
+	applyAnthropicThinkingConfig(body, req)
 	if err := ApplyAnthropicExtraParams(body, req.AnthropicExtraParamsEnabled, req.AnthropicExtraParamsJSON); err != nil {
 		finishedAt = time.Now().UTC()
 		recordLLMSummaryArtifact(req, buildLLMSummaryPayload(req, "anthropic", modelID, startedAt, time.Time{}, finishedAt, "", 0, 0, 0, 0, err))
@@ -1066,7 +1078,7 @@ func anthropicStableProviderMessageCount(input []Message, stableReplayMessageCou
 	if len(stableReplayMessages) == 0 {
 		return 0
 	}
-	_, messages, err := normalizeAnthropicProviderMessages(stableReplayMessages, thinkingEnabled)
+	_, messages, err := normalizeAnthropicProviderMessages(stableReplayMessages, thinkingEnabled, false)
 	if err != nil {
 		return 0
 	}
@@ -1114,7 +1126,16 @@ func isAnthropicCacheableBlock(block map[string]any) bool {
 	case contentPartTypeText:
 		return strings.TrimSpace(anthropicStringField(block, "text")) != ""
 	case "tool_result":
-		return strings.TrimSpace(anthropicStringField(block, "content")) != ""
+		switch content := block["content"].(type) {
+		case string:
+			return strings.TrimSpace(content) != ""
+		case []map[string]any:
+			return len(content) > 0
+		case []any:
+			return len(content) > 0
+		default:
+			return false
+		}
 	case "tool_use":
 		return strings.TrimSpace(anthropicStringField(block, "id")) != "" && strings.TrimSpace(anthropicStringField(block, "name")) != ""
 	default:
@@ -1122,10 +1143,20 @@ func isAnthropicCacheableBlock(block map[string]any) bool {
 	}
 }
 
-func normalizeAnthropicProviderMessages(input []Message, thinkingEnabled bool) ([]string, []anthropicMessage, error) {
+// anthropicThinkingCarrier 记录请求内最近一个有 reasoning+signature 的 assistant 轮次。
+// thinking 模式下上游要求每个 assistant 轮次都回传 thinking 块；当某轮次（如 DeepSeek
+// adaptive thinking 跳过思考的 tool-call 轮次）没有 reasoning 时，用 carrier 的
+// thinking+signature 兜底，避免上游 "thinking must be passed back" 400。
+type anthropicThinkingCarrier struct {
+	reasoning string
+	signature string
+}
+
+func normalizeAnthropicProviderMessages(input []Message, thinkingEnabled bool, relocateImages bool) ([]string, []anthropicMessage, error) {
 	systemParts := make([]string, 0, len(input))
 	messages := make([]anthropicMessage, 0, len(input))
 	pendingToolResults := make([]map[string]any, 0, 2)
+	var thinkingCarrier *anthropicThinkingCarrier
 	flushToolResults := func() {
 		if len(pendingToolResults) == 0 {
 			return
@@ -1156,14 +1187,30 @@ func normalizeAnthropicProviderMessages(input []Message, thinkingEnabled bool) (
 			if toolUseID == "" {
 				return nil, nil, fmt.Errorf("anthropic tool message requires tool_call_id")
 			}
+			var content any = message.Content
+			if hasImageContentParts(message.ContentParts) {
+				contentBlocks, err := anthropicContentBlocks(message)
+				if err != nil {
+					return nil, nil, err
+				}
+				content = contentBlocks
+			}
 			pendingToolResults = append(pendingToolResults, map[string]any{
 				"type":        "tool_result",
 				"tool_use_id": toolUseID,
-				"content":     message.Content,
+				"content":     content,
 			})
 		case "user", "assistant":
 			flushToolResults()
-			contentBlocks, err := anthropicProviderContentBlocks(message, thinkingEnabled)
+			if thinkingEnabled && role == "assistant" {
+				if reasoning := strings.TrimSpace(message.ReasoningContent); reasoning != "" {
+					thinkingCarrier = &anthropicThinkingCarrier{
+						reasoning: reasoning,
+						signature: anthropicThinkingSignature(message),
+					}
+				}
+			}
+			contentBlocks, err := anthropicProviderContentBlocks(message, thinkingEnabled, thinkingCarrier)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1208,10 +1255,71 @@ func normalizeAnthropicProviderMessages(input []Message, thinkingEnabled bool) (
 		}
 	}
 	flushToolResults()
+	if relocateImages {
+		messages = relocateAnthropicImagesToLastUserMessage(messages)
+	}
 	return systemParts, messages, nil
 }
 
-func anthropicProviderContentBlocks(message Message, thinkingEnabled bool) ([]map[string]any, error) {
+// relocateAnthropicImagesToLastUserMessage 把所有 user 消息里的 image 块搬运到最后一条 user 消息的末尾。
+//
+// 背景：部分第三方中转站（如 Bedrock 代理）在 Anthropic→上游 的消息转换中，
+// 会丢弃「后面还跟着大量文本/消息」的非末尾图片块。将图片统一移动到末条 user 消息
+// 可规避该问题，同时保留图片信息本身。
+//
+// 数据流演变：
+//
+//	[user_info] [query + IMG] [reminder] [reminder] [current_request]
+//	→ [user_info] [query] [reminder] [reminder] [current_request + IMG]
+//
+// 搬运后若某条 user 消息 content 变空，则丢弃该消息，避免 Anthropic 拒绝空内容消息。
+func relocateAnthropicImagesToLastUserMessage(messages []anthropicMessage) []anthropicMessage {
+	lastUserIndex := -1
+	for index := len(messages) - 1; index >= 0; index-- {
+		if strings.TrimSpace(messages[index].Role) == "user" {
+			lastUserIndex = index
+			break
+		}
+	}
+	if lastUserIndex < 0 {
+		return messages
+	}
+
+	relocated := make([]map[string]any, 0, 2)
+	for index := 0; index < len(messages); index++ {
+		if index == lastUserIndex || strings.TrimSpace(messages[index].Role) != "user" {
+			continue
+		}
+		kept := make([]map[string]any, 0, len(messages[index].Content))
+		for _, block := range messages[index].Content {
+			if isAnthropicImageBlock(block) {
+				relocated = append(relocated, block)
+				continue
+			}
+			kept = append(kept, block)
+		}
+		messages[index].Content = kept
+	}
+	if len(relocated) == 0 {
+		return messages
+	}
+	messages[lastUserIndex].Content = append(messages[lastUserIndex].Content, relocated...)
+
+	compacted := make([]anthropicMessage, 0, len(messages))
+	for index, message := range messages {
+		if index != lastUserIndex && strings.TrimSpace(message.Role) == "user" && len(message.Content) == 0 {
+			continue
+		}
+		compacted = append(compacted, message)
+	}
+	return compacted
+}
+
+func isAnthropicImageBlock(block map[string]any) bool {
+	return strings.TrimSpace(anthropicStringField(block, "type")) == "image"
+}
+
+func anthropicProviderContentBlocks(message Message, thinkingEnabled bool, carrier *anthropicThinkingCarrier) ([]map[string]any, error) {
 	blocks, err := anthropicContentBlocks(message)
 	if err != nil {
 		return nil, err
@@ -1220,11 +1328,17 @@ func anthropicProviderContentBlocks(message Message, thinkingEnabled bool) ([]ma
 		return blocks, nil
 	}
 
+	reasoning := strings.TrimSpace(message.ReasoningContent)
+	signature := anthropicThinkingSignature(message)
+	if reasoning == "" && carrier != nil {
+		reasoning = carrier.reasoning
+		signature = carrier.signature
+	}
 	thinkingBlock := map[string]any{
 		"type":     "thinking",
-		"thinking": message.ReasoningContent,
+		"thinking": reasoning,
 	}
-	if signature := anthropicThinkingSignature(message); signature != "" {
+	if signature != "" {
 		thinkingBlock["signature"] = signature
 	}
 	return append([]map[string]any{thinkingBlock}, blocks...), nil
@@ -1308,9 +1422,6 @@ func shouldIncludeAnthropicThinkingBlock(message Message, thinkingEnabled bool) 
 	if strings.TrimSpace(message.Role) != "assistant" {
 		return false
 	}
-	if strings.TrimSpace(message.ReasoningContent) == "" {
-		return false
-	}
 	return true
 }
 
@@ -1365,6 +1476,34 @@ func buildAnthropicThinkingConfig(req StreamRequest) map[string]any {
 		"type":    "adaptive",
 		"display": "summarized",
 	}
+}
+
+// applyAnthropicThinkingConfig 在请求体构造完成后（含 RequestBodyOverride 路径）无条件调用，
+// 与 openai.go 的 applyOpenAIThinkingDisable 对称。它把 thinking 配置写入 body 并在 disabled
+// 时清理与之冲突的字段，确保两条构造路径行为一致：
+//   - disabled: 强制 thinking:{type:"disabled"}，删除 output_config / 残留 thinking adaptive 配置，
+//     记录 thinking_disabled_provider_param=thinking.type knob
+//   - adaptive: 按 AnthropicThinkingEffort 写 thinking:{type:adaptive,display:summarized} + output_config
+//
+// 在 override 路径下，上层若已在 override body 里塞了 thinking/output_config，disabled 时会被正确覆盖。
+func applyAnthropicThinkingConfig(body map[string]any, req StreamRequest) {
+	if len(body) == 0 {
+		return
+	}
+	if normalizeRuntimeThinkingEffort(req.ThinkingEffort) != "disabled" {
+		if strings.TrimSpace(req.AnthropicThinkingEffort) == "" {
+			return
+		}
+		body["thinking"] = map[string]any{
+			"type":    "adaptive",
+			"display": "summarized",
+		}
+		body["output_config"] = buildAnthropicOutputConfig(req)
+		return
+	}
+	body["thinking"] = map[string]any{"type": "disabled"}
+	delete(body, "output_config")
+	setRequestKnob(req, "thinking_disabled_provider_param", "thinking.type")
 }
 
 func buildAnthropicOutputConfig(req StreamRequest) map[string]any {

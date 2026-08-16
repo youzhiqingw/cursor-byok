@@ -77,7 +77,7 @@ func (service *Service) maybeCompactBeforeProvider(stream *ActiveStream, convers
 	if service == nil || stream == nil || conversation == nil {
 		return false, nil
 	}
-	manualInstruction, manual := parseManualCompactionDirective(stream.LatestUserText)
+	manualInstruction, manual := streamManualCompactionDirective(stream)
 	plan, err := service.buildCompactionPlan(stream, conversation, compiled, manual, manualInstruction)
 	if err != nil {
 		return false, err
@@ -234,7 +234,7 @@ func (service *Service) buildLegacyCompactionPlan(base *compactionPlan, conversa
 	if conversation == nil || base == nil {
 		return nil, nil
 	}
-	candidates := buildContextCompactionCandidates(checkpointProjectionEntries(conversation.Entries), base.CurrentTurnSeq, base.CurrentRequestID)
+	candidates := buildContextCompactionCandidates(replayablePromptProjectionEntries(conversation.Entries), base.CurrentTurnSeq, base.CurrentRequestID)
 	if len(candidates) == 0 {
 		return nil, nil
 	}
@@ -260,7 +260,7 @@ func (service *Service) buildAutoCompactionPlanFromHistory(base *compactionPlan,
 	if err != nil {
 		return nil, err
 	}
-	currentCandidate, hasCurrentCandidate := buildCurrentTurnCompactionCandidate(checkpointProjectionEntries(conversation.Entries), base.CurrentTurnSeq, base.CurrentRequestID)
+	currentCandidate, hasCurrentCandidate := buildCurrentTurnCompactionCandidate(replayablePromptProjectionEntries(conversation.Entries), base.CurrentTurnSeq, base.CurrentRequestID)
 	if !hasCurrentCandidate {
 		return legacyPlan, nil
 	}
@@ -447,16 +447,8 @@ func (service *Service) handleCompactionEvent(stream *ActiveStream, payload *str
 		if err := service.completeManualCompactionTurn(stream); err != nil {
 			return service.failStream(stream, "unknown", err)
 		}
-		if err := service.broker.Publish(stream.RequestID, StreamEvent{
-			Message: buildTurnEndedMessage(0, 0, 0, 0),
-		}); err != nil {
-			return service.failStream(stream, "unknown", err)
-		}
-		if err := service.broker.Complete(stream.RequestID, "", ""); err != nil {
-			return service.failStream(stream, "unknown", err)
-		}
-		service.setTurnPhase(stream, TurnPhaseCompleted)
-		return nil
+		completion := manualCompactionTurnCompletion(stream)
+		return service.publishCheckpointWithCompletion(stream.RequestID, stream.ConversationID, &completion)
 	}
 	return service.requestProviderAction(stream, providerActionResume)
 }
@@ -500,12 +492,8 @@ func (service *Service) finishManualCompactionNoop(stream *ActiveStream) error {
 	if err := service.completeManualCompactionTurn(stream); err != nil {
 		return err
 	}
-	if err := service.broker.Publish(stream.RequestID, StreamEvent{
-		Message: buildTurnEndedMessage(0, 0, 0, 0),
-	}); err != nil {
-		return err
-	}
-	return service.broker.Complete(stream.RequestID, "", "")
+	completion := manualCompactionTurnCompletion(stream)
+	return service.publishCheckpointWithCompletion(stream.RequestID, stream.ConversationID, &completion)
 }
 
 func (service *Service) completeManualCompactionTurn(stream *ActiveStream) error {
@@ -530,8 +518,19 @@ func (service *Service) completeManualCompactionTurn(stream *ActiveStream) error
 	if err := service.syncSummaryCarryForward(conversationID, requestID, modelCallID); err != nil {
 		return err
 	}
-	service.setTurnPhase(stream, TurnPhaseCompleted)
 	return nil
+}
+
+func manualCompactionTurnCompletion(stream *ActiveStream) pendingTurnCompletion {
+	if stream == nil {
+		return pendingTurnCompletion{}
+	}
+	return pendingTurnCompletion{
+		ConversationID: strings.TrimSpace(stream.ConversationID),
+		RequestID:      strings.TrimSpace(stream.RequestID),
+		TurnSeq:        stream.TurnSeq,
+		ModelCallID:    "turn:" + strings.TrimSpace(stream.RequestID),
+	}
 }
 
 func (service *Service) publishSummaryCompleted(stream *ActiveStream, hookMessage string) error {
@@ -568,6 +567,7 @@ func (service *Service) applyCompactionPlan(stream *ActiveStream, conversationID
 	if err != nil {
 		return err
 	}
+	originalEntryCount := len(candidateConversation.Entries)
 	if err := applyCompactionToConversation(candidateConversation, plan, summaryText); err != nil {
 		return err
 	}
@@ -582,9 +582,9 @@ func (service *Service) applyCompactionPlan(stream *ActiveStream, conversationID
 	if validationErr := validateCompactionCandidateBudget(recompiled, plan); validationErr != nil {
 		return validationErr
 	}
-	replacementEntries := append([]HistoryEntry(nil), candidateConversation.Entries...)
+	compactionEntries := append([]HistoryEntry(nil), candidateConversation.Entries[originalEntryCount:]...)
 	if service.store != nil {
-		persisted, err := service.store.ReplaceEntries(conversationID, replacementEntries, func(item *ConversationFile) error {
+		persisted, _, err := service.store.AppendEntriesWithUpdate(conversationID, resetEntrySequences(compactionEntries), func(item *ConversationFile) error {
 			if item == nil {
 				return nil
 			}
@@ -605,10 +605,7 @@ func (service *Service) applyCompactionPlan(stream *ActiveStream, conversationID
 		if item == nil {
 			return nil
 		}
-		item.Entries = nil
-		item.NextEntrySeq = 1
-		item.NextTurnSeq = 1
-		appendEntriesInPlace(item, resetEntrySequences(replacementEntries))
+		appendEntriesInPlace(item, resetEntrySequences(compactionEntries))
 		item.TokenDetailsUsedTokens = 0
 		clearConversationAutoCompactionState(item)
 		return nil
@@ -643,14 +640,13 @@ func applyCompactionToConversation(conversation *ConversationFile, plan *Pending
 	if conversation == nil || plan == nil {
 		return nil
 	}
-	replacementEntries, err := buildCompactedContextEntries(conversation, plan, summaryText)
+	compactionEntries, err := buildCompactedContextEntries(conversation, plan, summaryText)
 	if err != nil {
 		return err
 	}
-	conversation.Entries = nil
-	conversation.NextEntrySeq = 1
-	conversation.NextTurnSeq = 1
-	appendEntriesInPlace(conversation, resetEntrySequences(replacementEntries))
+	// Canonical history stays append-only. The prompt projector applies the
+	// latest summary marker when constructing model-visible replay.
+	appendEntriesInPlace(conversation, resetEntrySequences(compactionEntries))
 	conversation.TokenDetailsUsedTokens = 0
 	clearConversationAutoCompactionState(conversation)
 	if conversation.TokenDetailsMaxTokens == 0 {
@@ -671,38 +667,7 @@ func buildCompactedContextEntries(conversation *ConversationFile, plan *PendingC
 	if ok {
 		entries = append(entries, runtimeEntry)
 	}
-	if conversation == nil || !plan.PreserveCurrentTurnInputs {
-		return entries, nil
-	}
-	entries = append(entries, buildAutoCompactionPreservedCurrentTurnEntries(conversation.Entries, plan)...)
 	return entries, nil
-}
-
-func buildAutoCompactionPreservedCurrentTurnEntries(entries []HistoryEntry, plan *PendingCompaction) []HistoryEntry {
-	if len(entries) == 0 || plan == nil || !plan.PreserveCurrentTurnInputs {
-		return nil
-	}
-	latestToolCallID := latestCompletedToolCallIDForTurn(entries, plan.CurrentTurnSeq, plan.CurrentRequestID)
-	preservedIndexes := autoCompactionPreservedEntryIndexes(entries, plan.CurrentTurnSeq, plan.CurrentRequestID, latestToolCallID)
-	if len(preservedIndexes) == 0 {
-		return nil
-	}
-	preserved := make([]HistoryEntry, 0, len(preservedIndexes))
-	for index, entry := range entries {
-		if _, ok := preservedIndexes[index]; !ok {
-			continue
-		}
-		switch strings.TrimSpace(entry.Kind) {
-		case "compaction_summary", "compacted_summary", "compaction_request":
-			continue
-		case "tool_result":
-			if rewritten, ok := rewriteAutoCompactionToolResultEntry(entry, autoCompactionPreservedToolResultLimitBytes, false); ok {
-				entry = rewritten
-			}
-		}
-		preserved = append(preserved, entry)
-	}
-	return preserved
 }
 
 func newCompactionSummaryEntry(plan *PendingCompaction, summaryText string) HistoryEntry {
@@ -827,7 +792,7 @@ func buildFallbackCompactionSummary(plan *PendingCompaction) string {
 		sections = append(sections, "Compaction note:\n"+truncateCompactionText(plan.HookMessage, 800))
 	}
 	if strings.TrimSpace(plan.ManualInstruction) != "" {
-		sections = append(sections, "Manual compact instruction:\n"+truncateCompactionText(plan.ManualInstruction, 800))
+		sections = append(sections, "Manual summarize instruction:\n"+truncateCompactionText(plan.ManualInstruction, 800))
 	}
 	return strings.TrimSpace(truncateCompactionText(strings.Join(sections, "\n\n"), compactionSummaryMaxChars))
 }
@@ -875,13 +840,62 @@ func (service *Service) resolveCompactionReserveTokens(modelID string) int64 {
 	return compactionAutoReserveTokens
 }
 
+func parseManualCompactionRequest(userMessage *agentv1.UserMessage) (string, bool) {
+	if userMessage == nil {
+		return "", false
+	}
+	userText := strings.TrimSpace(userMessage.GetText())
+	if instruction, ok := parseManualCompactionDirective(userText); ok {
+		return instruction, true
+	}
+	if userText != "" {
+		return "", false
+	}
+	selectedContext := userMessage.GetSelectedContext()
+	if selectedContext == nil {
+		return "", false
+	}
+	for _, command := range selectedContext.GetCursorCommands() {
+		if !isCursorSummarizeCommand(command) {
+			continue
+		}
+		instruction, _ := parseManualCompactionDirective(command.GetContent())
+		return instruction, true
+	}
+	return "", false
+}
+
+func streamManualCompactionDirective(stream *ActiveStream) (string, bool) {
+	if stream == nil {
+		return "", false
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if stream.ManualCompaction.Requested {
+		return strings.TrimSpace(stream.ManualCompaction.Instruction), true
+	}
+	return parseManualCompactionDirective(stream.LatestUserText)
+}
+
+func isCursorSummarizeCommand(command *agentv1.SelectedCursorCommand) bool {
+	if command == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(command.GetName()), "glass-action-summarize") {
+		return true
+	}
+	_, ok := parseManualCompactionDirective(command.GetContent())
+	return ok
+}
+
 func parseManualCompactionDirective(latestUserText string) (string, bool) {
 	trimmed := strings.TrimSpace(latestUserText)
+	const directive = "/summarize"
 	switch {
-	case trimmed == "/compact":
+	case trimmed == directive:
 		return "", true
-	case strings.HasPrefix(trimmed, "/compact "):
-		return strings.TrimSpace(strings.TrimPrefix(trimmed, "/compact")), true
+	case strings.HasPrefix(trimmed, directive+" "):
+		return strings.TrimSpace(strings.TrimPrefix(trimmed, directive)), true
 	default:
 		return "", false
 	}

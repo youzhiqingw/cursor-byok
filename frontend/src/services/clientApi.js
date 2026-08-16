@@ -1,7 +1,10 @@
 import {
+  DisconnectCursorAccount,
+  GetCursorAccountStatus,
   GetState,
   LoadUserConfig,
   SaveUserConfig,
+  StartCursorAccountLogin,
   StartProxy,
   StopProxy,
 } from "@bindings/cursor/internal/bridge/proxyservice.js";
@@ -10,11 +13,9 @@ import {
   CheckForUpdates,
   GetAppVersion,
   InstallReadyUpdate,
-  GetModelEditorContext,
   OpenConfigWindow,
   OpenHistoryWindow,
   OpenModelConfigWindow,
-  OpenModelEditorWindow,
 } from "@bindings/cursor/internal/bridge/windowservice.js";
 import { Call } from "@wailsio/runtime";
 
@@ -54,6 +55,18 @@ export function loadUserConfig() {
 
 export function saveUserConfig(payload) {
   return withApiLogging("SaveUserConfig", payload, () => SaveUserConfig(payload));
+}
+
+export function getCursorAccountStatus() {
+  return withApiLogging("GetCursorAccountStatus", undefined, () => GetCursorAccountStatus());
+}
+
+export function startCursorAccountLogin() {
+  return withApiLogging("StartCursorAccountLogin", undefined, () => StartCursorAccountLogin());
+}
+
+export function disconnectCursorAccount() {
+  return withApiLogging("DisconnectCursorAccount", undefined, () => DisconnectCursorAccount());
 }
 
 export function getProxyState() {
@@ -104,16 +117,6 @@ export function openModelConfig() {
   return withApiLogging("OpenModelConfigWindow", undefined, () => OpenModelConfigWindow());
 }
 
-export function openModelEditor(index, adapterJSON) {
-  return withApiLogging("OpenModelEditorWindow", { index, adapterJSON }, () =>
-    OpenModelEditorWindow(index, adapterJSON),
-  );
-}
-
-export function getModelEditorContext() {
-  return withApiLogging("GetModelEditorContext", undefined, () => GetModelEditorContext());
-}
-
 export function testModelAdapter(adapter) {
   return Call.ByName(`${PROXY_SERVICE_NAME}.TestModelAdapter`, adapter).then(
     (result) => {
@@ -130,5 +133,11 @@ export function testModelAdapter(adapter) {
 export function getModelAdapterTestResults() {
   return withApiLogging("GetModelAdapterTestResults", undefined, () =>
     Call.ByName(`${PROXY_SERVICE_NAME}.GetModelAdapterTestResults`),
+  );
+}
+
+export function fetchModelAdapterModels(payload) {
+  return withApiLogging("FetchModelAdapterModels", payload, () =>
+    Call.ByName(`${PROXY_SERVICE_NAME}.FetchModelAdapterModels`, payload),
   );
 }

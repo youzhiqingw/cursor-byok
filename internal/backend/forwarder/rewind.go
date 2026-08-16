@@ -224,6 +224,7 @@ func (service *Service) applyRunRewindToConversation(conversation *ConversationF
 	conversation.Entries = nil
 	conversation.NextEntrySeq = 1
 	conversation.NextTurnSeq = 1
+	conversation.ImportedTurnIDs = rewindImportedTurnPrefix(conversation.ImportedTurnIDs, decision)
 	appendEntriesInPlace(conversation, appendReplacementRunEntries(decision.PrefixEntries, entries))
 	applyRunRewindConversationState(conversation, intent, turnSeq)
 	deriveConversationLoopState(conversation)
@@ -260,14 +261,37 @@ func applyRunRewindMetadata(conversation *ConversationFile, source *Conversation
 		conversation.ParentConversationID = strings.TrimSpace(source.ParentConversationID)
 		conversation.ParentToolCallID = strings.TrimSpace(source.ParentToolCallID)
 		conversation.SubagentTypeName = strings.TrimSpace(source.SubagentTypeName)
+		if folder := normalizeAgentTranscriptsFolder(source.AgentTranscriptsFolder); folder != "" {
+			conversation.AgentTranscriptsFolder = folder
+		}
 		if strings.TrimSpace(source.Mode) != "" {
 			conversation.Mode = strings.TrimSpace(source.Mode)
 		}
 		if source.TokenDetailsMaxTokens > 0 {
 			conversation.TokenDetailsMaxTokens = source.TokenDetailsMaxTokens
 		}
+		decision := runRewindDecision{TargetTurnSeq: turnSeq}
+		if intent.ConversationState != nil {
+			decision.HasClientTurnCount = true
+			decision.ClientTurnCount = len(intent.ConversationState.GetTurns())
+		}
+		conversation.ImportedTurnIDs = rewindImportedTurnPrefix(source.ImportedTurnIDs, decision)
 	}
 	applyRunRewindConversationState(conversation, intent, turnSeq)
+}
+
+func rewindImportedTurnPrefix(importedTurnIDs [][]byte, decision runRewindDecision) [][]byte {
+	keep := decision.TargetTurnSeq - 1
+	if decision.HasClientTurnCount {
+		keep = int64(decision.ClientTurnCount)
+	}
+	if keep <= 0 || len(importedTurnIDs) == 0 {
+		return nil
+	}
+	if keep > int64(len(importedTurnIDs)) {
+		keep = int64(len(importedTurnIDs))
+	}
+	return cloneByteSlices(importedTurnIDs[:keep])
 }
 
 func (service *Service) logRunRewindDecision(requestID string, conversationID string, eventName string, decision runRewindDecision) {
