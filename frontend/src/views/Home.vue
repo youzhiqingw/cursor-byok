@@ -3,6 +3,7 @@ import Button from "@/components/ui/Button.vue";
 import Card from "@/components/ui/Card.vue";
 import HomeMetricsCard from "@/components/HomeMetricsCard.vue";
 import CursorAccountCard from "@/components/CursorAccountCard.vue";
+import Switch from "@/components/ui/Switch.vue";
 import { useMessage } from "@/composables/useMessage";
 import { getAdRuntime } from "@/services/clientApi";
 import {
@@ -10,6 +11,7 @@ import {
   appViewState,
   openConfigWindow,
   openModelConfigWindow,
+  saveTabServer,
   syncHomeMetrics,
   syncServiceState,
   toUserError,
@@ -127,6 +129,16 @@ async function handleOpenModelConfig() {
   }
 }
 
+function handleTabServerChange(value) {
+  saveTabServer({ enabled: value, baseURL: appState.tabServerBaseURL }).then((result) => {
+    if (!result.ok) {
+      showActionError("保存失败", result.error);
+      return;
+    }
+    message(value ? "已开启" : "已关闭");
+  });
+}
+
 onMounted(() => {
   unsubscribeAdUpdated = Events.On(AD_UPDATED_EVENT, handleAdUpdated);
   void syncAdRuntimeQuietly();
@@ -171,6 +183,20 @@ onBeforeUnmount(() => {
           class="rounded-[8px] border border-[#4b1d1d] bg-[#2a1313] px-3 py-2 text-sm text-[#fca5a5]">
           {{ appState.serviceLastError }}
         </div>
+      </div>
+    </Card>
+
+    <Card>
+      <div class="space-y-4">
+        <Switch
+          :enabled="appState.tabServerEnabled"
+          label="Tab 外发"
+          description="开启后 Tab 补全数据将发往外部服务器（默认 tab.leokun.cn）"
+          enabledText="已开启"
+          disabledText="已关闭"
+          @change="handleTabServerChange"
+        />
+        <div class="text-xs text-[#a3a3a3]">重启服务后生效</div>
       </div>
     </Card>
 

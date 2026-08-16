@@ -23,7 +23,7 @@ import (
 
 const healthPath = "/healthz"
 
-const tabServerBaseURL = "https://tab.leokun.cn"
+const defaultTabServerBaseURL = serverconfig.DefaultTabServerBaseURL
 
 type Host struct {
 	store            *serverconfig.Store
@@ -274,7 +274,10 @@ func (host *Host) rebuildLocked(cfg serverconfig.Config) error {
 	routeDeps := upstream.Dependencies{
 		SystemSettingService: &serverSystemSettings{configs: host.configs},
 		HTTPClient:           netproxy.NewHTTPClient(30000 * time.Second),
+		TabServerBaseURL:     resolveTabServerBaseURL(cfg),
+		TabServerEnabled:     cfg.TabServer.Enabled,
 	}
+	logger.Infof("tab server routing: enabled=%v base_url=%s", cfg.TabServer.Enabled, routeDeps.TabServerBaseURL)
 
 	host.mux = server.New(
 		server.Use(
@@ -779,11 +782,29 @@ func uploadServiceProcedure(pattern string, name string, protocol server.RouteOp
 	)
 }
 
+func resolveTabServerBaseURL(cfg serverconfig.Config) string {
+	baseURL := strings.TrimSpace(cfg.TabServer.BaseURL)
+	if baseURL == "" {
+		baseURL = defaultTabServerBaseURL
+	}
+	return baseURL
+}
+
 func tabServerProcedure(pattern string, name string, protocol server.RouteOption, deps upstream.Dependencies) server.Option {
+	if !deps.TabServerEnabled {
+		return server.POST(pattern,
+			server.Name(name),
+			protocol,
+			server.Local(func(ctx *server.Context) error {
+				http.NotFound(ctx.Writer, ctx.Request)
+				return nil
+			}),
+		)
+	}
 	forward := upstream.ForwardAction(deps, upstream.CompatRouteConfig{Name: name})
 	action := func(ctx *server.Context) error {
 		if ctx != nil && ctx.Request != nil && ctx.Request.URL != nil {
-			baseURL, err := url.Parse(tabServerBaseURL)
+			baseURL, err := url.Parse(deps.TabServerBaseURL)
 			if err != nil {
 				return fmt.Errorf("解析 tab server 地址失败: %w", err)
 			}

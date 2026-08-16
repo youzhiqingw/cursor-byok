@@ -36,6 +36,8 @@ type Dependencies struct {
 	HTTPClient           HTTPClient
 	LogRoot              string
 	Routes               []Route
+	TabServerBaseURL     string
+	TabServerEnabled     bool
 }
 
 type RequestContext struct {

@@ -536,6 +536,7 @@ function loadCachedState() {
 function normalizeConfig(source) {
   const raw = source && typeof source === "object" ? source : {};
   const homeMetrics = raw.homeMetrics && typeof raw.homeMetrics === "object" ? raw.homeMetrics : {};
+  const tabServer = raw.tabServer && typeof raw.tabServer === "object" ? raw.tabServer : {};
   return {
     log: asBoolean(raw.log),
     providerStreamIdleTimeout: asPositiveInteger(raw.providerStreamIdleTimeout),
@@ -544,6 +545,10 @@ function normalizeConfig(source) {
     modelAdapters: normalizeModelAdapters(raw.modelAdapters),
     homeMetrics: {
       includeCacheWriteInHitRate: asBoolean(homeMetrics.includeCacheWriteInHitRate),
+    },
+    tabServer: {
+      enabled: asBoolean(tabServer.enabled),
+      baseURL: asString(tabServer.baseURL),
     },
     lastAgentModelHash: asString(raw.lastAgentModelHash),
   };
@@ -585,6 +590,7 @@ function buildConfigPayload(source = appState) {
     proxyListenAddr: normalized.proxyListenAddr,
     modelAdapters: normalized.modelAdapters.map(({ id, ...adapter }) => adapter),
     homeMetrics: normalized.homeMetrics,
+    tabServer: normalized.tabServer,
     lastAgentModelHash: normalized.lastAgentModelHash,
   };
 }
@@ -599,6 +605,8 @@ function applyConfigToState(config, { modelAdaptersOnly = false } = {}) {
   appState.configBackendListenAddr = normalized.backendListenAddr;
   appState.configProxyListenAddr = normalized.proxyListenAddr;
   appState.includeCacheWriteInHitRate = normalized.homeMetrics.includeCacheWriteInHitRate;
+  appState.tabServerEnabled = normalized.tabServer.enabled;
+  appState.tabServerBaseURL = normalized.tabServer.baseURL;
   return normalized;
 }
 
@@ -822,6 +830,8 @@ export const appState = reactive({
   configBackendListenAddr: cachedConfig.backendListenAddr,
   configProxyListenAddr: cachedConfig.proxyListenAddr,
   includeCacheWriteInHitRate: cachedConfig.homeMetrics.includeCacheWriteInHitRate,
+  tabServerEnabled: cachedConfig.tabServer.enabled,
+  tabServerBaseURL: cachedConfig.tabServer.baseURL,
 
   serviceRunning: asBoolean(cachedState.serviceRunning),
   backendRunning: asBoolean(cachedState.backendRunning),
@@ -1116,6 +1126,10 @@ export async function persistUserConfig() {
       ...currentConfig.homeMetrics,
       includeCacheWriteInHitRate: appState.includeCacheWriteInHitRate,
     },
+    tabServer: {
+      enabled: asBoolean(appState.tabServerEnabled),
+      baseURL: asString(appState.tabServerBaseURL),
+    },
   });
 }
 
@@ -1133,6 +1147,28 @@ export async function saveIncludeCacheWriteInHitRate(value) {
   });
   if (!result.ok) {
     appState.includeCacheWriteInHitRate = previousValue;
+  }
+  return result;
+}
+
+export async function saveTabServer({ enabled, baseURL } = {}) {
+  const currentConfig = await loadPersistedUserConfig();
+  const previousEnabled = appState.tabServerEnabled;
+  const previousBaseURL = appState.tabServerBaseURL;
+  const nextEnabled = asBoolean(enabled);
+  const nextBaseURL = asString(baseURL);
+  appState.tabServerEnabled = nextEnabled;
+  appState.tabServerBaseURL = nextBaseURL;
+  const result = await persistConfigPayload({
+    ...currentConfig,
+    tabServer: {
+      enabled: nextEnabled,
+      baseURL: nextBaseURL,
+    },
+  });
+  if (!result.ok) {
+    appState.tabServerEnabled = previousEnabled;
+    appState.tabServerBaseURL = previousBaseURL;
   }
   return result;
 }

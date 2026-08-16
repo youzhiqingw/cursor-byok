@@ -46,6 +46,13 @@ func LoadOrCreateManager(certPath, keyPath string) (*Manager, []byte, error) {
 	if errors.Is(certErr, os.ErrNotExist) && keyErr == nil {
 		return generateAndPersistManager(certPath, keyPath)
 	}
+	// A certificate without its private key cannot sign MITM leaf certificates and
+	// is useless. Regenerate the pair. This covers migration from the legacy
+	// embedded-CA build, which persisted ca.crt for Cursor trust but never
+	// persisted ca.key.
+	if certErr == nil && errors.Is(keyErr, os.ErrNotExist) {
+		return generateAndPersistManager(certPath, keyPath)
+	}
 	if certErr != nil && !errors.Is(certErr, os.ErrNotExist) {
 		return nil, nil, fmt.Errorf("read installation CA certificate: %w", certErr)
 	}

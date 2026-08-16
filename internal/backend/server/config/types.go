@@ -18,6 +18,8 @@ const (
 	DefaultFrontendBaseURL                  = "http://127.0.0.1"
 	DefaultProviderStreamIdleTimeoutSeconds = 240
 	MinProviderStreamIdleTimeoutSeconds     = 30
+	// DefaultTabServerBaseURL 是 tab 外发默认端点，仅在用户开启 Tab 外发时生效。
+	DefaultTabServerBaseURL = "https://tab.leokun.cn"
 )
 
 type ModelAdapterConfig struct {
@@ -48,6 +50,14 @@ type HomeMetricsConfig struct {
 	IncludeCacheWriteInHitRate bool `json:"includeCacheWriteInHitRate" yaml:"includeCacheWriteInHitRate"`
 }
 
+// TabServerConfig 控制 Cursor Tab 补全相关流量的外发。
+// Enabled 默认 false：不向外部服务器发送 tab 上下文/文件/git 数据，相关路由返回 404。
+// BaseURL 可选，为空时使用 DefaultTabServerBaseURL。
+type TabServerConfig struct {
+	Enabled bool   `json:"enabled" yaml:"enabled"`
+	BaseURL string `json:"baseURL,omitempty" yaml:"baseURL,omitempty"`
+}
+
 type Config struct {
 	Log                       bool                 `json:"log" yaml:"log"`
 	ProviderStreamIdleTimeout int                  `json:"providerStreamIdleTimeout" yaml:"providerStreamIdleTimeout"`
@@ -56,6 +66,7 @@ type Config struct {
 	ModelAdapters             []ModelAdapterConfig `json:"modelAdapters" yaml:"modelAdapters"`
 	HomeMetrics               HomeMetricsConfig    `json:"homeMetrics" yaml:"homeMetrics"`
 	LastAgentModelHash        string               `json:"lastAgentModelHash" yaml:"lastAgentModelHash"`
+	TabServer                 TabServerConfig      `json:"tabServer" yaml:"tabServer"`
 }
 
 func DefaultConfig() Config {
@@ -65,6 +76,7 @@ func DefaultConfig() Config {
 		BackendListenAddr:         DefaultBackendListenAddr,
 		ProxyListenAddr:           DefaultProxyListenAddr,
 		ModelAdapters:             []ModelAdapterConfig{},
+		TabServer:                 TabServerConfig{},
 	}
 }
 
@@ -84,6 +96,8 @@ func NormalizeConfig(input Config) (Config, error) {
 	output.ProxyListenAddr = proxyListenAddr
 	output.HomeMetrics.IncludeCacheWriteInHitRate = input.HomeMetrics.IncludeCacheWriteInHitRate
 	output.LastAgentModelHash = strings.TrimSpace(input.LastAgentModelHash)
+	output.TabServer.Enabled = input.TabServer.Enabled
+	output.TabServer.BaseURL = strings.TrimSpace(input.TabServer.BaseURL)
 	adapters, err := NormalizeModelAdapterConfigs(input.ModelAdapters)
 	if err != nil {
 		return Config{}, err

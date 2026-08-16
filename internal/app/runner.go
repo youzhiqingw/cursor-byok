@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"cursor/internal/appdata"
 	serverconfig "cursor/internal/backend/server/config"
 	"cursor/internal/buildinfo"
 
@@ -57,20 +58,18 @@ func Run(resources EmbeddedResources) error {
 	logger.Init()
 	netproxy.InstallDefaultTransport()
 
-	embeddedCACertPEM := certs.EmbeddedCACertPEM()
-	logEmbeddedCAInfo(embeddedCACertPEM)
-
-	certManager, err := certs.NewEmbeddedManager()
+	certManager, caCertPEM, err := certs.LoadOrCreateManager(appdata.CACertFilePath(), appdata.CAKeyFilePath())
 	if err != nil {
 		return err
 	}
+	logEmbeddedCAInfo(caCertPEM)
 
 	defaultBackendBaseURL := "http://" + serverconfig.DefaultBackendListenAddr
 	proxyServer, err := mitm.NewProxyServer(serverconfig.DefaultProxyListenAddr, defaultBackendBaseURL, "", "", certManager)
 	if err != nil {
 		return err
 	}
-	proxyService := bridge.NewProxyService(proxyServer, certManager, embeddedCACertPEM)
+	proxyService := bridge.NewProxyService(proxyServer, certManager, caCertPEM)
 	metricsService := bridge.NewMetricsService()
 	windowService := bridge.NewWindowService()
 	var updateManager *updater.Manager

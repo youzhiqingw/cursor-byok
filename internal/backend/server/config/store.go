@@ -139,6 +139,9 @@ func shouldPersistNormalizedConfig(raw []byte, current Config, normalized Config
 	if yamlHasKey(raw, "routing") {
 		return true
 	}
+	if yamlHasKey(raw, "tabServer") {
+		return true
+	}
 	if !yamlHasKey(raw, "backendListenAddr") || !yamlHasKey(raw, "proxyListenAddr") {
 		return true
 	}
