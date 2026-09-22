@@ -144,7 +144,10 @@ tasks:
       - rm -rf "{{.STAGING_DIR}}"
       - mkdir -p "{{.STAGING_DIR}}"
       - cp "{{.OUTPUT}}" "{{.STAGING_DIR}}/"
-      - (cd "{{.STAGING_DIR}}" && zip -qry "../{{.ZIP_NAME}}" .)
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -Command "$z = Join-Path '{{.BIN_DIR}}' '{{.ZIP_NAME}}'; New-Item -ItemType Directory -Force -Path (Split-Path $z -Parent) | Out-Null; Compress-Archive -Path '{{.STAGING_DIR}}\*' -DestinationPath $z -Force"
+        platforms: [windows]
+      - cmd: (cd "{{.STAGING_DIR}}" && zip -qry "../{{.ZIP_NAME}}" .)
+        platforms: [darwin, linux]
       - rm -rf "{{.STAGING_DIR}}"
       - rm -f "{{.OUTPUT}}"
 
