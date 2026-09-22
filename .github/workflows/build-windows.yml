@@ -1,9 +1,8 @@
 name: Build Windows (Cursor助手)
 
-# 云端编译：生成 Windows 可执行程序（zip + exe + sha256）
-# 触发方式：
-#   - 手动：仓库 Actions 页面 → 本工作流 → Run workflow（可选分支/标签）
-#   - 自动：推送 v* 标签时构建并发布 GitHub Release
+# 云端编译：生成 Windows 可执行程序（zip/exe/sha256/update.json）
+# - 自动更新兼容：Release 内含 update.json 清单 + <base>-<ver>-windows-amd64.zip（与 updater 约定一致）
+# - 触发：手动运行（任意分支/标签）；推送 v* 标签自动构建并发布 GitHub Release
 # 仅作用于 youzhiqingw/cursor-byok
 
 on:
@@ -14,7 +13,7 @@ on:
         required: false
         default: "main"
       release_notes:
-        description: "附加到 Release 的说明（仅标签推送时生效）"
+        description: "附加到 Release 的说明（仅标签推送时生效，留空则用 release-notes.md）"
         required: false
         default: ""
   push:
@@ -32,7 +31,6 @@ jobs:
   build-windows:
     name: 构建 Windows amd64
     runs-on: windows-2022
-    # 仅在自己的仓库运行（防止 fork/他人仓库意外启用）
     if: github.repository == 'youzhiqingw/cursor-byok'
 
     steps:
@@ -66,8 +64,7 @@ jobs:
         shell: pwsh
         run: |
           go install github.com/go-task/task/v3/cmd/task@latest
-          $goBin = go env GOPATH
-          echo "$goBin\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          echo "$(go env GOPATH)\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       - name: 安装 wails3 CLI
         shell: pwsh
@@ -96,46 +93,103 @@ jobs:
           task common:generate:proto
           (Get-ChildItem gen -Recurse -Filter *.go | Measure-Object).Count
 
-      - name: 构建 Windows 可执行程序并打包
+      - name: 读取版本并校验（标签必须与 build/config.yml 一致，否则自动更新会失效）
         shell: pwsh
         run: |
-          task build:windows:amd64 ZIP_NAME=windows-64.zip SCAN=true
-          Get-ChildItem bin | Select-Object Name, Length
+          $ver = (go run ./scripts/release version -config ./build/config.yml | Select-Object -Last 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($ver)) { throw "无法从 build/config.yml 读取版本" }
+          echo "BUILD_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          echo "构建版本: $ver"
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $tag = $env:GITHUB_REF_NAME
+            if ("v$ver" -ne $tag) {
+              throw "标签 $tag 与 build/config.yml 版本 v$ver 不一致。自动更新按 tags=版本 匹配，请先修改 build/config.yml 或修正标签。"
+            }
+            echo "标签与版本一致: $tag"
+          }
 
-      - name: 提取 exe 并生成校验和
+      - name: 构建 Windows 发布资产（cursor-byok-<ver>-windows-amd64.zip）
         shell: pwsh
         run: |
-          Expand-Archive -Path bin/windows-64.zip -DestinationPath bin/extracted -Force
-          Copy-Item bin/extracted/*.exe bin/windows-64.exe -Force
-          Get-FileHash bin/windows-64.exe -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  windows-64.exe" } | Out-File bin/windows-64.exe.sha256
-          Get-ChildItem bin | Select-Object Name, Length
+          # zip 不会自动创建目标目录（上游 release:prepare 靠 release:clean 建目录，此处手动补齐）
+          New-Item -ItemType Directory -Force -Path "bin/release/$env:BUILD_VERSION" | Out-Null
+          task release:build:windows:amd64 SCAN=true
+          Get-ChildItem "bin/release/$env:BUILD_VERSION" | Select-Object Name, Length
 
-      - name: 上传构件（zip / exe / sha256）
+      - name: 提取 exe、生成 sha256 与 update.json 清单
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = $env:BUILD_VERSION
+          $dir = "bin/release/$ver"
+          $zipName = "cursor-byok-$ver-windows-amd64.zip"
+          $zipPath = Join-Path $dir $zipName
+          if (-not (Test-Path $zipPath)) { throw "缺少 $zipPath" }
+
+          # 提取 exe（发布资产附带独立 exe）
+          $extractDir = Join-Path $dir "extracted"
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+          $innerExe = Get-ChildItem $extractDir -Filter *.exe | Select-Object -First 1
+          if ($null -eq $innerExe) { throw "zip 内未找到 exe" }
+          $exeName = "cursor-byok-$ver-windows-amd64.exe"
+          Copy-Item $innerExe.FullName (Join-Path $dir $exeName) -Force
+          Remove-Item $extractDir -Recurse -Force
+
+          # sha256
+          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zipName" | Out-File (Join-Path $dir "$zipName.sha256") -Encoding utf8
+
+          # update.json（updater 读取：更新源 your 仓库 /releases/latest/download/update.json）
+          $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "v$ver" }
+          $url = "https://github.com/youzhiqingw/cursor-byok/releases/download/$tag/$zipName"
+          $zipBytes = [System.IO.File]::ReadAllBytes($zipPath)
+          $notes = ""
+          if (Test-Path "release-notes.md") { $notes = (Get-Content "release-notes.md" -Raw).Trim() }
+          if ([string]::IsNullOrWhiteSpace($notes)) { $notes = "Release v$ver" }
+          $manifest = [ordered]@{
+            version      = $ver
+            release_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            release_notes = $notes
+            platforms    = [ordered]@{
+              "windows-amd64" = [ordered]@{
+                url      = $url
+                size     = $zipBytes.Length
+                checksum = "sha256:$hash"
+              }
+            }
+            mandatory    = $false
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Out-File (Join-Path $dir "update.json") -Encoding utf8
+          Get-ChildItem $dir | Select-Object Name, Length
+
+      - name: 上传构建产物（zip/exe/sha256/update.json）
         uses: actions/upload-artifact@v4
         with:
           name: cursor-byok-windows-amd64-${{ github.sha }}
-          path: |
-            bin/windows-64.zip
-            bin/windows-64.exe
-            bin/windows-64.exe.sha256
+          path: bin/release/${{ env.BUILD_VERSION }}/*
           if-no-files-found: error
 
-      - name: 发布 GitHub Release（标签推送时）
+      - name: 发布 GitHub Release（标签推送时，含 update.json 自动更新清单）
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "${{ github.ref_name }}"
-          $notes = "${{ inputs.release_notes }}"
-          $assets = "bin/windows-64.zip", "bin/windows-64.exe", "bin/windows-64.exe.sha256"
-          if ($notes) {
-            gh release create $tag $assets --title $tag --notes $notes 2>$null
+          $dir = "bin/release/$env:BUILD_VERSION"
+          $assets = @(
+            (Join-Path $dir "cursor-byok-$env:BUILD_VERSION-windows-amd64.zip"),
+            (Join-Path $dir "cursor-byok-$env:BUILD_VERSION-windows-amd64.exe"),
+            (Join-Path $dir "cursor-byok-$env:BUILD_VERSION-windows-amd64.zip.sha256"),
+            (Join-Path $dir "update.json")
+          )
+          $notesArg = "${{ inputs.release_notes }}"
+          if ($notesArg) {
+            gh release create $tag $assets --title $tag --notes $notesArg 2>$null
           } else {
             gh release create $tag $assets --title $tag --generate-notes 2>$null
           }
           if ($LASTEXITCODE -ne 0) {
-            # Release 已存在则仅补充构件
             gh release upload $tag $assets
           }
           gh release view $tag
