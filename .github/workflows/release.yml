@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and release (e.g. v1.0.2). Must already exist and match version."
+        required: true
 
 permissions:
   contents: write
@@ -19,6 +24,7 @@ jobs:
     outputs:
       should_publish: ${{ steps.release.outputs.should_publish }}
       version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,33 +40,23 @@ jobs:
             exit 1
           fi
 
-      - name: Verify updater signing key
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        shell: bash
-        run: |
-          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]]; then
-            echo "TAURI_SIGNING_PRIVATE_KEY is not configured" >&2
-            exit 1
-          fi
-
       - name: Read and verify app version
         id: version
         shell: bash
         run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
           version=$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")
           package_version=$(node -p "require('./apps/desktop/package.json').version")
           cargo_version=$(sed -n '/^version = / { s/version = "\([^"]*\)"/\1/p; q; }' apps/desktop/src-tauri/Cargo.toml)
           test "${version}" = "${package_version}"
           test "${version}" = "${cargo_version}"
-          test "${GITHUB_REF_TYPE}" = "tag"
-          test "${GITHUB_REF_NAME}" = "v${version}"
-          git fetch origin main:refs/remotes/origin/main
-          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
-            echo "Release tag must point to a commit contained in origin/main" >&2
-            exit 1
-          fi
+          test "${TAG}" = "v${version}"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
 
       - name: Check whether this version is already published
         id: release
@@ -95,11 +91,11 @@ jobs:
             target: ""
           - platform: macos-aarch64
             os: macos-15
-            args: "--target aarch64-apple-darwin"
+            args: ""
             target: aarch64-apple-darwin
           - platform: macos-x86_64
             os: macos-15-intel
-            args: "--target x86_64-apple-darwin"
+            args: ""
             target: x86_64-apple-darwin
 
     runs-on: ${{ matrix.os }}
@@ -136,70 +132,17 @@ jobs:
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ contains(matrix.platform, 'macos') && '-' || '' }}
         with:
           projectPath: apps/desktop
-          tagName: v__VERSION__
-          releaseName: Cursor BYOK v__VERSION__
-          releaseBody: ${{ contains(needs.prepare.outputs.version, '-') && 'Beta release. Download the installer for your platform from the assets below.' || 'Download the installer for your platform from the assets below.' }}
+          tagName: ${{ needs.prepare.outputs.tag }}
+          releaseName: Cursor BYOK ${{ needs.prepare.outputs.tag }}
+          releaseBody: "Personal build. Download the installer for your platform from the assets below."
           releaseDraft: true
           prerelease: false
-          uploadUpdaterJson: true
-          args: ${{ matrix.args }}
-
-      - name: Package legacy Linux updater asset
-        if: matrix.platform == 'linux-x86_64'
-        shell: bash
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          mkdir -p legacy-update
-          tar -czf "legacy-update/cursor-byok-${VERSION}-linux-amd64.tar.gz" -C target/release cursor-byok-desktop
-
-      - name: Package and sign legacy Windows updater asset
-        if: matrix.platform == 'windows-x86_64'
-        shell: pwsh
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          New-Item -ItemType Directory -Force legacy-update | Out-Null
-          $asset = "legacy-update/cursor-byok-$env:VERSION-windows-amd64.zip"
-          Compress-Archive -LiteralPath target/release/cursor-byok-desktop.exe -DestinationPath $asset
-          Push-Location apps/desktop
-          npm exec tauri signer sign -- "../../$asset"
-          Pop-Location
-          $entries = @(tar -tf $asset)
-          if ($entries.Count -ne 1 -or [System.IO.Path]::GetFileName($entries[0]) -ne 'cursor-byok-desktop.exe') {
-            throw "Windows updater archive must contain only cursor-byok-desktop.exe"
-          }
-          if (!(Test-Path "$asset.sig")) {
-            throw "Windows updater archive signature was not generated"
-          }
-
-      - name: Package legacy macOS updater asset
-        if: contains(matrix.platform, 'macos')
-        shell: bash
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          mkdir -p legacy-update
-          archive=$(find "target/${{ matrix.target }}/release/bundle/macos" -maxdepth 1 -name '*.app.tar.gz' -print -quit)
-          test -n "${archive}"
-          legacy_platform=macos-arm64
-          if [[ "${{ matrix.platform }}" = "macos-x86_64" ]]; then
-            legacy_platform=macos-amd64
-          fi
-          cp "${archive}" "legacy-update/cursor-byok-${VERSION}-${legacy_platform}.tar.gz"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: legacy-update-${{ matrix.platform }}
-          path: legacy-update/*
-          if-no-files-found: error
+          # No updater artifacts / no code-signing key in this fork.
+          uploadUpdaterJson: false
+          args: ${{ matrix.args }} ${{ matrix.target != '' && format('--target {0}', matrix.target) || '' }}
 
   finalize:
     name: Publish GitHub Release
@@ -208,73 +151,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: legacy-update-*
-          path: legacy-update
-          merge-multiple: true
-
-      - name: Generate legacy update manifest
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          node .github/scripts/generate-legacy-update.mjs \
-            --version "${VERSION}" \
-            --repository "${GITHUB_REPOSITORY}" \
-            --assets-dir legacy-update \
-            --output legacy-update/update.json \
-            --notes "Cursor BYOK v${VERSION}"
-
-      - name: Generate signed Windows portable update manifest
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          asset="cursor-byok-${VERSION}-windows-amd64.zip"
-          test -f "legacy-update/${asset}"
-          test -f "legacy-update/${asset}.sig"
-          node .github/scripts/generate-portable-update.mjs \
-            --version "${VERSION}" \
-            --repository "${GITHUB_REPOSITORY}" \
-            --asset "${asset}" \
-            --signature "legacy-update/${asset}.sig" \
-            --output legacy-update/portable-latest.json
-
-      - name: Normalize Tauri updater download URLs
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          mkdir -p tauri-update
-          release_id=$(
-            gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-              --jq ".[] | select(.tag_name == \"v${VERSION}\") | .id"
-          )
-          test -n "${release_id}"
-          gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" > tauri-update/release.json
-          asset_id=$(node -p 'require("./tauri-update/release.json").assets.find(({ name }) => name === "latest.json")?.id ?? ""')
-          test -n "${asset_id}"
-          gh api \
-            -H "Accept: application/octet-stream" \
-            "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
-            > tauri-update/latest.json
-          node .github/scripts/normalize-tauri-update.mjs \
-            --manifest tauri-update/latest.json \
-            --release tauri-update/release.json \
-            --repository "${GITHUB_REPOSITORY}" \
-            --version "${VERSION}"
-
-      - name: Upload normalized Tauri updater manifest
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: gh release upload "v${VERSION}" tauri-update/latest.json --clobber
-
-      - name: Upload legacy updater assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: gh release upload "v${VERSION}" legacy-update/* --clobber
 
       - name: Publish the completed release
         env:
