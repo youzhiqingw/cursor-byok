@@ -74,46 +74,15 @@ jobs:
           fi
 
   publish:
-    name: Publish (${{ matrix.platform }})
+    name: Publish (windows-x86_64)
     needs: prepare
     if: needs.prepare.outputs.should_publish == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux-x86_64
-            os: ubuntu-22.04
-            args: ""
-            target: ""
-          - platform: windows-x86_64
-            os: windows-latest
-            args: "--bundles nsis"
-            target: ""
-          - platform: macos-aarch64
-            os: macos-15
-            args: ""
-            target: aarch64-apple-darwin
-          - platform: macos-x86_64
-            os: macos-15-intel
-            args: ""
-            target: x86_64-apple-darwin
-
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Linux system dependencies
-        if: matrix.platform == 'linux-x86_64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
-
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Rust target
-        if: matrix.target != ''
-        run: rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -132,17 +101,15 @@ jobs:
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_SIGNING_IDENTITY: ${{ contains(matrix.platform, 'macos') && '-' || '' }}
         with:
           projectPath: apps/desktop
           tagName: ${{ needs.prepare.outputs.tag }}
           releaseName: Cursor BYOK ${{ needs.prepare.outputs.tag }}
-          releaseBody: "Personal build. Download the installer for your platform from the assets below."
+          releaseBody: "Personal build (Windows x64). Download the installer from the assets below."
           releaseDraft: true
           prerelease: false
-          # No updater artifacts / no code-signing key in this fork.
           uploadUpdaterJson: false
-          args: ${{ matrix.args }} ${{ matrix.target != '' && format('--target {0}', matrix.target) || '' }}
+          args: "--bundles nsis"
 
   finalize:
     name: Publish GitHub Release
