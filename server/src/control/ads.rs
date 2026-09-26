@@ -107,6 +107,8 @@ pub enum AdActionType {
 }
 
 impl AdRuntime {
+    // 本地定制：去广告后这两个方法不再被调用，保留以备恢复。
+    #[allow(dead_code)]
     pub(super) fn into_menu_slots(mut self) -> Result<Self> {
         self.slots
             .retain(|slot| slot.enabled && slot.placement == AdPlacement::Menu);
@@ -118,6 +120,7 @@ impl AdRuntime {
         Ok(self)
     }
 
+    #[allow(dead_code)]
     pub(super) async fn cache_images(&mut self, client: &reqwest::Client) {
         let cache_dir = match config::managed_data_dir() {
             Ok(path) => path.join("ads"),

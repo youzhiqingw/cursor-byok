@@ -105,6 +105,11 @@ impl CaManager {
     }
 
     pub fn initialize_local(&self) -> Result<()> {
+        // 本地定制修复：证书存在但私钥缺失（旧版迁移残留）时，证书无法签发 MITM
+        // 叶子证书，直接重新生成一对，避免启动失败。
+        if self.cert_path().exists() && !self.key_path().exists() {
+            self.generate()?;
+        }
         match self.state()? {
             CaState::Invalid => {
                 return Err(Error::Config("CA files are incomplete or invalid".into()))

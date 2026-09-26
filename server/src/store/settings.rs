@@ -62,9 +62,11 @@ impl ProxyMode {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TabMode {
+    // 本地定制：默认直连 Cursor，不向外部 tab 服务发送上下文/文件/git 数据；
+    // 用户可在设置中手动切到 Public 或 Custom。
     #[default]
-    Public,
     Direct,
+    Public,
     Custom,
 }
 
@@ -238,6 +240,8 @@ impl Store {
         Ok(())
     }
 
+    // 本地定制：去广告后不再上报设备 ID，该方法暂未被调用，保留以备恢复。
+    #[allow(dead_code)]
     pub(crate) async fn installation_id(&self) -> Result<String> {
         let generated = uuid::Uuid::new_v4().to_string();
         let _write = self.writes.lock().await;
