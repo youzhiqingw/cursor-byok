@@ -91,11 +91,11 @@ jobs:
             target: ""
           - platform: macos-aarch64
             os: macos-15
-            args: "--target aarch64-apple-darwin --bundles dmg"
+            args: "--target aarch64-apple-darwin --bundles app"
             target: aarch64-apple-darwin
           - platform: macos-x86_64
             os: macos-15-intel
-            args: "--target x86_64-apple-darwin --bundles dmg"
+            args: "--target x86_64-apple-darwin --bundles app"
             target: x86_64-apple-darwin
 
     runs-on: ${{ matrix.os }}
@@ -141,6 +141,35 @@ jobs:
           prerelease: false
           uploadUpdaterJson: false
           args: ${{ matrix.args }}
+
+      - name: Create macOS DMG
+        if: startsWith(matrix.platform, 'macos-')
+        working-directory: apps/desktop
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ARCH="${TARGET#*-}"
+          APP="src-tauri/target/${TARGET}/release/bundle/macos/Cursor BYOK.app"
+          STAGING="$(mktemp -d)"
+          DMG_OUT="src-tauri/target/${TARGET}/release/bundle/dmg"
+          DMG="${DMG_OUT}/Cursor BYOK_${VERSION}_${ARCH}.dmg"
+          test -d "${APP}"
+          mkdir -p "${DMG_OUT}"
+          cp -R "${APP}" "${STAGING}/"
+          ln -s /Applications "${STAGING}/Applications"
+          hdiutil create \
+            -volname "Cursor BYOK" \
+            -srcfolder "${STAGING}" \
+            -ov \
+            -format UDZO \
+            "${DMG}"
+          rm -rf "${STAGING}"
+          gh release upload "${TAG}" "${DMG}" --clobber
 
   finalize:
     name: Publish GitHub Release
