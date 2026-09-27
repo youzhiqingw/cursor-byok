@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build and release (e.g. v1.0.2). Must already exist and match version."
+        description: "Tag to build and release (e.g. v1.0.5). Must already exist and match version."
         required: true
 
 permissions:
@@ -74,15 +74,36 @@ jobs:
           fi
 
   publish:
-    name: Publish (windows-x86_64)
+    name: Publish (${{ matrix.platform }})
     needs: prepare
     if: needs.prepare.outputs.should_publish == 'true'
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            os: windows-latest
+            args: "--bundles nsis"
+            target: ""
+          - platform: macos-aarch64
+            os: macos-14
+            args: "--target aarch64-apple-darwin --bundles dmg"
+            target: aarch64-apple-darwin
+          - platform: macos-x86_64
+            os: macos-15-intel
+            args: "--target x86_64-apple-darwin --bundles dmg"
+            target: x86_64-apple-darwin
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust target
+        if: matrix.target != ''
+        run: rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -105,11 +126,11 @@ jobs:
           projectPath: apps/desktop
           tagName: ${{ needs.prepare.outputs.tag }}
           releaseName: Cursor BYOK ${{ needs.prepare.outputs.tag }}
-          releaseBody: "Personal build (Windows x64). Download the installer from the assets below."
+          releaseBody: "Personal build. Download the installer for your platform from the assets below."
           releaseDraft: true
           prerelease: false
           uploadUpdaterJson: false
-          args: "--bundles nsis"
+          args: ${{ matrix.args }}
 
   finalize:
     name: Publish GitHub Release
