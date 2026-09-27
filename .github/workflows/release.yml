@@ -154,9 +154,9 @@ jobs:
         run: |
           set -euo pipefail
           ARCH="${TARGET#*-}"
-          APP="src-tauri/target/${TARGET}/release/bundle/macos/Cursor BYOK.app"
+          APP="../../target/${TARGET}/release/bundle/macos/Cursor BYOK.app"
           STAGING="$(mktemp -d)"
-          DMG_OUT="src-tauri/target/${TARGET}/release/bundle/dmg"
+          DMG_OUT="../../target/${TARGET}/release/bundle/dmg"
           DMG="${DMG_OUT}/Cursor BYOK_${VERSION}_${ARCH}.dmg"
           test -d "${APP}"
           mkdir -p "${DMG_OUT}"
