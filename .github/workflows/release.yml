@@ -159,6 +159,9 @@ jobs:
           DMG_OUT="target/${TARGET}/release/bundle/dmg"
           DMG="${DMG_OUT}/Cursor BYOK_${VERSION}_${ARCH}.dmg"
           test -d "${APP}"
+          df -h .
+          find "target/${TARGET}/release" -mindepth 1 -maxdepth 1 ! -name bundle -exec rm -rf {} +
+          df -h .
           mkdir -p "${DMG_OUT}"
           cp -R "${APP}" "${STAGING}/"
           ln -s /Applications "${STAGING}/Applications"
