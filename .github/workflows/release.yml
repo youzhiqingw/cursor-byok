@@ -160,7 +160,10 @@ jobs:
           DMG="${DMG_OUT}/Cursor BYOK_${VERSION}_${ARCH}.dmg"
           test -d "${APP}"
           df -h .
-          find "target/${TARGET}/release" -mindepth 1 -maxdepth 1 ! -name bundle -exec rm -rf {} +
+for entry in "target/${TARGET}/release"/* "target/${TARGET}/release"/.[!.]* "target/${TARGET}/release"/..?*; do
+  [ -e "${entry}" ] || [ -L "${entry}" ] || continue
+  [ "${entry##*/}" = bundle ] || rm -rf "${entry}"
+done
           df -h .
           mkdir -p "${DMG_OUT}"
           cp -R "${APP}" "${STAGING}/"
