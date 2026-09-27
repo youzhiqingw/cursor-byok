@@ -79,6 +79,7 @@ jobs:
     if: needs.prepare.outputs.should_publish == 'true'
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - platform: linux-x86_64
@@ -144,7 +145,6 @@ jobs:
 
       - name: Create macOS DMG
         if: startsWith(matrix.platform, 'macos-')
-        working-directory: apps/desktop
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -153,10 +153,10 @@ jobs:
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
-          ARCH="${TARGET#*-}"
-          APP="src-tauri/target/${TARGET}/release/bundle/macos/Cursor BYOK.app"
+          ARCH="${TARGET%%-*}"
+          APP="target/${TARGET}/release/bundle/macos/Cursor BYOK.app"
           STAGING="$(mktemp -d)"
-          DMG_OUT="src-tauri/target/${TARGET}/release/bundle/dmg"
+          DMG_OUT="target/${TARGET}/release/bundle/dmg"
           DMG="${DMG_OUT}/Cursor BYOK_${VERSION}_${ARCH}.dmg"
           test -d "${APP}"
           mkdir -p "${DMG_OUT}"
