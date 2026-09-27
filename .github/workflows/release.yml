@@ -81,12 +81,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - platform: linux-x86_64
+            os: ubuntu-22.04
+            args: ""
+            target: ""
           - platform: windows-x86_64
             os: windows-latest
             args: "--bundles nsis"
             target: ""
           - platform: macos-aarch64
-            os: macos-14
+            os: macos-15
             args: "--target aarch64-apple-darwin --bundles dmg"
             target: aarch64-apple-darwin
           - platform: macos-x86_64
@@ -98,6 +102,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'linux-x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
 
       - uses: dtolnay/rust-toolchain@stable
 
