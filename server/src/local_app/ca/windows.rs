@@ -5,7 +5,7 @@ use std::{ffi::c_void, io, ptr, slice};
 
 use windows_sys::Win32::Security::Cryptography::{
     CertCloseStore, CertEnumCertificatesInStore, CertOpenStore, CERT_STORE_OPEN_EXISTING_FLAG,
-    CERT_STORE_PROV_SYSTEM_W, CERT_STORE_READONLY_FLAG, CERT_SYSTEM_STORE_LOCAL_MACHINE,
+    CERT_STORE_PROV_SYSTEM_W, CERT_STORE_READONLY_FLAG, CERT_SYSTEM_STORE_CURRENT_USER,
 };
 
 use crate::{Error, Result};
@@ -44,8 +44,9 @@ fn certificate_der(cert: &str) -> Result<Vec<u8>> {
 }
 
 fn open_root_store() -> Result<*mut c_void> {
+    // 本地定制：查当前用户 Root 存储，配合 `certutil -user -addstore Root`，无需管理员权限。
     let flags =
-        CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_OPEN_EXISTING_FLAG | CERT_STORE_READONLY_FLAG;
+        CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_OPEN_EXISTING_FLAG | CERT_STORE_READONLY_FLAG;
     let store = unsafe {
         CertOpenStore(
             CERT_STORE_PROV_SYSTEM_W,
